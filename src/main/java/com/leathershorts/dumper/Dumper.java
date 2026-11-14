@@ -87,14 +87,14 @@ public class Dumper {
 
         // Main extraction block for server side
         try {
-            try (@Nullable InputStream manifest = Dumper.class.getResourceAsStream("/manifest.json")) {
+            try (@Nullable InputStream manifest = Dumper.class.getResourceAsStream("/dumper_manifest.json")) {
                 if (manifest == null) {
-                    throw new IOException("manifest.json not found");
+                    throw new IOException("dumper_manifest.json not found");
                 }
 
                 FileUtils.copyInputStreamToFile(
                     manifest,
-                    OUT_DIR.resolve("manifest.json").toFile()
+                    OUT_DIR.resolve("dumper_manifest.json").toFile()
                 );
             }
 
