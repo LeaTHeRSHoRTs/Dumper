@@ -56,7 +56,8 @@ public class Dumper {
     public Dumper() {
         // Initialise the dumper directory
         try {
-            Files.createDirectories(OUT_DIR);
+            FileUtils.deleteDirectory(OUT_DIR.toFile());
+            FileUtils.forceMkdir(OUT_DIR.toFile());
             LOGGER.info("Output directory for dumper: {}", OUT_DIR.toAbsolutePath());
         } catch (IOException e) {
             LOGGER.error("Failed to create output directory", e);
