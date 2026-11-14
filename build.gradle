@@ -1,3 +1,5 @@
+import java.time.Instant
+
 buildscript {
     repositories {
         // These repositories are only for Gradle plugins, put any other repositories in the repository block further below
@@ -25,6 +27,8 @@ base {
 java {
     toolchain.languageVersion = JavaLanguageVersion.of(17)
 }
+
+jarJar.enable()
 
 minecraft {
     // The mappings can be changed at any time and must be in the following format.
@@ -103,8 +107,7 @@ dependencies {
     // Specify the version of Minecraft to use.
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
 
-    // Commented out because I dont use mixins right now
-    //annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+    jarJar("commons-io:commons-io:[2.18.0,3.0)")
 }
 
 // This block of code expands all declared replace properties in the specified resource targets.
@@ -113,11 +116,12 @@ tasks.named('processResources', ProcessResources).configure {
                              forge_version       : forge_version, forge_version_range: forge_version_range,
                              loader_version_range: loader_version_range,
                              mod_id              : mod_id, mod_name: mod_name, mod_license: mod_license, mod_version: mod_version,
-                             mod_authors         : mod_authors, mod_description: mod_description,]
+                             mod_authors         : mod_authors, mod_description: mod_description,
+                             generated_at: Instant.now().toString(),]
 
     inputs.properties replaceProperties
 
-    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta', 'manifest.json']) {
         expand replaceProperties + [project: project]
     }
 }

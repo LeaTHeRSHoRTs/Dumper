@@ -9,12 +9,11 @@ import net.minecraft.server.packs.resources.ResourceManager;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.fml.DistExecutor;
 import net.minecraftforge.server.ServerLifecycleHooks;
+import org.apache.commons.io.FileUtils;
 import org.slf4j.Logger;
 
 import java.io.*;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.Map;
 import java.util.function.Predicate;
 
@@ -23,7 +22,9 @@ public final class ResourceScraper {
     private final ResourceManager manager;
     private final Path masterFolder;
 
-    public ResourceScraper(Side side, Path masterFolder) {
+    public ResourceScraper(Side side, Path masterFolder) throws IOException {
+        FileUtils.forceMkdir(masterFolder.toFile());
+
         this.manager = switch (side) {
             case CLIENT -> DistExecutor.unsafeCallWhenOn(
                 Dist.CLIENT,
@@ -49,17 +50,16 @@ public final class ResourceScraper {
             ResourceLocation id = entry.getKey();
             Resource resource = entry.getValue();
 
-            Path destination = this.masterFolder.resolve(folder).resolve(id.getNamespace()).resolve(id.getPath());
-            Files.createDirectories(destination.getParent());
+            Path destination = this.masterFolder.resolve(id.getNamespace()).resolve(id.getPath());
 
             try (InputStream input = resource.open()) {
-                Files.copy(input, destination, StandardCopyOption.REPLACE_EXISTING);
+                FileUtils.copyInputStreamToFile(input, destination.toFile());
             }
         }
 
         LOGGER.info(
             "Successfully scraped {} resources from {} into {}",
-            resources.size(), folder, this.masterFolder.resolve(folder)
+            resources.size(), folder, this.masterFolder
         );
     }
 

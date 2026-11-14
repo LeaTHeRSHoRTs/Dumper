@@ -1,0 +1,9 @@
+{
+  "dumper_version": "${mod_version}",
+  "dumper_environment": {
+    "minecraft_version": "${minecraft_version}",
+    "forge_version": "${forge_version}",
+    "loader": "forge"
+  },
+  "generated_at": "${generated_at}"
+}

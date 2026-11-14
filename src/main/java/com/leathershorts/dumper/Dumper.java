@@ -1,11 +1,13 @@
 package com.leathershorts.dumper;
 
+import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
 import com.leathershorts.dumper.scrapers.*;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraftforge.api.distmarker.Dist;
@@ -16,14 +18,21 @@ import net.minecraftforge.fml.DistExecutor;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.registries.ForgeRegistries;
 import net.minecraftforge.server.ServerLifecycleHooks;
+import org.apache.commons.io.FileUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import java.io.IOException;
-import java.io.Writer;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.spi.FileSystemProvider;
+import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 // The value here should match an entry in the META-INF/mods.toml file
 @Mod(Dumper.MOD_ID)
@@ -31,11 +40,15 @@ public class Dumper {
     public final Path OUT_DIR = Path.of("dumper");
     public static final String MOD_ID = "dumper";
     private static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
     // Flags
     private static volatile boolean scrapedClient = false;
     private static volatile boolean scrapedServer = false;
     private static boolean quitRequested = false;
+
+    // Message interval timer
+    private int messageTimer = 0;
 
     /**
      * Entrypoint of all dumper operations
@@ -73,10 +86,20 @@ public class Dumper {
 
         // Main extraction block for server side
         try {
+            try (@Nullable InputStream manifest = Dumper.class.getResourceAsStream("/manifest.json")) {
+                if (manifest == null) {
+                    throw new IOException("manifest.json not found");
+                }
+
+                FileUtils.copyInputStreamToFile(
+                    manifest,
+                    OUT_DIR.resolve("manifest.json").toFile()
+                );
+            }
+
             writeToFile("mods.json", ModScraper.scrape());
 
             // Create and populate the data directory
-            Files.createDirectories(OUT_DIR.resolve("data"));
             ResourceScraper scraper = new ResourceScraper(ResourceScraper.Side.SERVER, OUT_DIR.resolve("data"));
             scraper.scrape("recipes");
             scraper.scrape("loot_tables");
@@ -98,7 +121,7 @@ public class Dumper {
             LOGGER.info("Created files from scraping");
 
             scrapedServer = true;
-        } catch (IOException e) {
+        } catch (IOException | NullPointerException e) {
             LOGGER.error("Failed to scrape modpack", e);
             quit();
         }
@@ -111,6 +134,19 @@ public class Dumper {
         // Make sure that the player is in a world that has loaded
         if (event.phase != TickEvent.Phase.END || Minecraft.getInstance().level == null) return;
 
+        if (!scrapedClient || !scrapedServer) {
+            Minecraft mc = Minecraft.getInstance();
+
+            if (mc.player != null && ++messageTimer >= 100) {
+                Minecraft.getInstance().player.displayClientMessage(
+                    Component.literal("Dumper is still scraping and dumping..."),
+                    false
+                );
+
+                messageTimer = 0;
+            }
+        }
+
         // Quit if the server and client have scraped
         if (scrapedClient) {
             if (scrapedServer) quit();
@@ -120,7 +156,6 @@ public class Dumper {
         // Main extraction block for client side
         try {
             // Create and populate the assets directory
-            Files.createDirectories(OUT_DIR.resolve("assets"));
             ResourceScraper scraper = new ResourceScraper(ResourceScraper.Side.CLIENT, OUT_DIR.resolve("assets"));
             scraper.scrape("models");
             scraper.scrape("blockstates");
@@ -128,7 +163,14 @@ public class Dumper {
             scraper.scrape("textures");
 
             scrapedClient = true;
-            if (scrapedServer) quit();
+            try {
+                zipOutput();
+                FileUtils.deleteDirectory(OUT_DIR.toFile());
+            } catch (IOException e) {
+                LOGGER.error("Failed to create dumper.zip", e);
+            } finally {
+                quit();
+            }
         } catch (IOException e) {
             LOGGER.error("Failed to scrape client assets", e);
             quit();
@@ -136,13 +178,30 @@ public class Dumper {
     }
 
     private void writeToFile(String output, JsonElement data) throws IOException {
-        Files.createDirectories(this.OUT_DIR.resolve(output).getParent());
+        FileUtils.writeStringToFile(
+            OUT_DIR.resolve(output).toFile(),
+            Dumper.GSON.toJson(data),
+            StandardCharsets.UTF_8
+        );
+        LOGGER.info("Created file {}", output);
+    }
 
-        try (Writer writer = Files.newBufferedWriter(this.OUT_DIR.resolve(output))) {
-            new GsonBuilder().setPrettyPrinting().create().toJson(data, writer);
-            LOGGER.info("Created file {}", output);
-        } catch (IOException e) {
-            throw new IOException("Failed to create file " + output, e);
+    private void zipOutput() throws IOException {
+        Path zip = OUT_DIR.resolveSibling("dumper.zip");
+
+        try (
+            ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(zip));
+            Stream<Path> paths = Files.walk(OUT_DIR)
+        ) {
+            paths.filter(Files::isRegularFile).forEach(file -> {
+                try {
+                    zos.putNextEntry(new ZipEntry(OUT_DIR.relativize(file).toString().replace('\\', '/')));
+                    Files.copy(file, zos);
+                    zos.closeEntry();
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
         }
     }
 
