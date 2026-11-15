@@ -75,7 +75,6 @@ minecraft {
             // Comma-separated list of namespaces to load gametests from. Empty = all namespaces.
             property 'forge.enabledGameTestNamespaces', mod_id
             property 'terminal.ansi', 'true'
-            jvmArgs '-Dlog4j.configurationFile=log4j2.xml'
 
             ['nozip', 'noquit', 'noauto'].each { flag ->
                 if (System.getProperty(flag) != null) {
