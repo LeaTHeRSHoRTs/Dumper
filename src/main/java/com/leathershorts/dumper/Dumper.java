@@ -2,14 +2,23 @@ package com.leathershorts.dumper;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import com.google.gson.JsonElement;
 import com.leathershorts.dumper.scrapers.*;
+import com.leathershorts.dumper.utils.DumperIO;
+import net.minecraft.CrashReport;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.Difficulty;
+import net.minecraft.world.level.GameRules;
+import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.LevelSettings;
+import net.minecraft.world.level.WorldDataConfiguration;
 import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.levelgen.WorldOptions;
+import net.minecraft.world.level.levelgen.presets.WorldPreset;
+import net.minecraft.world.level.levelgen.presets.WorldPresets;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.TickEvent;
@@ -25,43 +34,49 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.spi.FileSystemProvider;
-import java.util.stream.Stream;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
 
 // The value here should match an entry in the META-INF/mods.toml file
 @Mod(Dumper.MOD_ID)
 public class Dumper {
-    public final Path OUT_DIR = Path.of("dumper");
+    public Path outDir = null;
     public static final String MOD_ID = "dumper";
-    private static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
-    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    public static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final Logger LOGGER = Dumper.getLogger(null);
 
     // Flags
-    private static volatile boolean scrapedClient = false;
-    private static volatile boolean scrapedServer = false;
-    private static boolean quitRequested = false;
+    private volatile boolean scrapedClient = false;
+    private volatile boolean scrapedServer = false;
+    private boolean quitRequested = false;
+    private boolean worldCreationStarted = false;
+
+    // Command-line flags
+    private final boolean noZip = Boolean.getBoolean("nozip");
+    private final boolean noAuto = Boolean.getBoolean("noauto");
+    private final boolean noQuit = Boolean.getBoolean("noquit");
 
     // Message interval timer
     private int messageTimer = 0;
 
-    /**
-     * Entrypoint of all dumper operations
-     */
+
+    /** Entrypoint of all dumper operations */
     public Dumper() {
+        LOGGER.info("noAuto: {}", this.noAuto);
+        LOGGER.info("noauto property: {}", System.getProperty("noauto"));
+        LOGGER.info("noZip: {}", this.noZip);
+        LOGGER.info("nozip property: {}", System.getProperty("nozip"));
+        LOGGER.info("noQuit: {}", this.noQuit);
+        LOGGER.info("noquit property: {}", System.getProperty("noquit"));
+
         // Initialise the dumper directory
         try {
-            FileUtils.deleteDirectory(OUT_DIR.toFile());
-            FileUtils.forceMkdir(OUT_DIR.toFile());
-            LOGGER.info("Output directory for dumper: {}", OUT_DIR.toAbsolutePath());
+            outDir = Files.createTempDirectory("dumper-");
+            LOGGER.info("Output directory for dumper: {}", outDir.toAbsolutePath());
         } catch (IOException e) {
             LOGGER.error("Failed to create output directory", e);
-            quit();
+            quit(e);
             return;
         }
 
@@ -74,10 +89,12 @@ public class Dumper {
         DistExecutor.unsafeRunWhenOn(Dist.CLIENT, () -> () -> MinecraftForge.EVENT_BUS.addListener(this::onClientTick));
     }
 
-    /**
-     * The scraping logic for the server side. Put everything that doesn't have to be client side in here
-     */
+
+    // Dumper event listeners
+    /** The scraping logic for the server side. Put everything that doesn't have to be client side in here */
     private void onServerStarted(ServerStartedEvent event) {
+        if (quitRequested) return;
+
         FileSystemProvider.installedProviders().forEach(provider -> {
             if (provider.getScheme().equals("jar")) {
                 LOGGER.info("Provider class: {}", provider.getClass().getName());
@@ -94,51 +111,79 @@ public class Dumper {
 
                 FileUtils.copyInputStreamToFile(
                     manifest,
-                    OUT_DIR.resolve("dumper_manifest.json").toFile()
+                    outDir.resolve("dumper_manifest.json").toFile()
                 );
             }
 
-            writeToFile("mods.json", ModScraper.scrape());
+
+            DumperIO dio = DumperIO.create(this.outDir);
+            dio.writeJson("mods.json", ModScraper.scrape());
 
             // Create and populate the data directory
-            ResourceScraper scraper = new ResourceScraper(ResourceScraper.Side.SERVER, OUT_DIR.resolve("data"));
+            ResourceScraper scraper = new ResourceScraper(ResourceScraper.Side.SERVER, outDir.resolve("data"));
             scraper.scrape("recipes");
             scraper.scrape("loot_tables");
             scraper.scrape("advancements");
 
-            // Populate the root with the rest
-            writeToFile("blocks.json", RegistryScraper.scrape(ForgeRegistries.BLOCKS));
-            writeToFile("items.json", RegistryScraper.scrape(ForgeRegistries.ITEMS));
-            writeToFile("entities.json", RegistryScraper.scrape(ForgeRegistries.ENTITY_TYPES));
-            writeToFile("effects.json", RegistryScraper.scrape(ForgeRegistries.MOB_EFFECTS));
-            writeToFile("enchantments.json", RegistryScraper.scrape(ForgeRegistries.ENCHANTMENTS));
-            writeToFile("fluids.json", RegistryScraper.scrape(ForgeRegistries.FLUIDS));
-
+            // Populate the biomes registry differently
             MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
-
             Registry<Biome> biomes = server.registryAccess().registryOrThrow(Registries.BIOME);
-            writeToFile("biomes.json", RegistryScraper.scrape(biomes));
 
+            // Populate the root with the rest
+            dio
+                .writeJson("blocks.json", RegistryScraper.scrape(ForgeRegistries.BLOCKS))
+                .writeJson("items.json", RegistryScraper.scrape(ForgeRegistries.ITEMS))
+                .writeJson("entities.json", RegistryScraper.scrape(ForgeRegistries.ENTITY_TYPES))
+                .writeJson("effects.json", RegistryScraper.scrape(ForgeRegistries.MOB_EFFECTS))
+                .writeJson("enchantments.json", RegistryScraper.scrape(ForgeRegistries.ENCHANTMENTS))
+                .writeJson("fluids.json", RegistryScraper.scrape(ForgeRegistries.FLUIDS))
+                .writeJson("biomes.json", RegistryScraper.scrape(biomes));
+
+            // Finish up
             LOGGER.info("Created files from scraping");
-
             scrapedServer = true;
         } catch (IOException | NullPointerException e) {
             LOGGER.error("Failed to scrape modpack", e);
-            quit();
+            quit(e);
         }
     }
 
-    /**
-     * The client scraping logic. Put everything that can't be server side in here
-     */
-    public void onClientTick(TickEvent.ClientTickEvent event) {
+    /** The client scraping logic. Put everything that can't be server side in here */
+    private void onClientTick(TickEvent.ClientTickEvent event) {
         // Make sure that the player is in a world that has loaded
-        if (event.phase != TickEvent.Phase.END || Minecraft.getInstance().level == null) return;
+        if (quitRequested || event.phase != TickEvent.Phase.END) return;
+
+        Minecraft mc = Minecraft.getInstance();
 
         if (!scrapedClient || !scrapedServer) {
-            Minecraft mc = Minecraft.getInstance();
+            if (mc.player == null || mc.level == null) {
+                if (!this.noAuto && !this.worldCreationStarted) {
+                    this.worldCreationStarted = true;
 
-            if (mc.player != null && ++messageTimer >= 100) {
+                    LevelSettings settings = new LevelSettings(
+                        "Dumper",
+                        GameType.CREATIVE,
+                        false,
+                        Difficulty.NORMAL,
+                        true,
+                        new GameRules(),
+                        WorldDataConfiguration.DEFAULT
+                    );
+
+                    mc.createWorldOpenFlows().createFreshLevel(
+                        "Dumper",
+                        settings,
+                        WorldOptions.defaultWithRandomSeed(),
+                        registryAccess -> registryAccess.registry(Registries.WORLD_PRESET)
+                            .flatMap(registry -> registry.getOptional(WorldPresets.FLAT))
+                            .map(WorldPreset::createWorldDimensions)
+                            .orElseGet(() -> WorldPresets.createNormalWorldDimensions(registryAccess))
+                    );
+                }
+                return;
+            }
+
+            if (++messageTimer >= 100) {
                 Minecraft.getInstance().player.displayClientMessage(
                     Component.literal("Dumper is still scraping and dumping..."),
                     false
@@ -149,71 +194,87 @@ public class Dumper {
         }
 
         // Quit if the server and client have scraped
-        if (scrapedClient) {
-            if (scrapedServer) quit();
+        if (scrapedClient && scrapedServer) {
+            LOGGER.info("Finished scraping minecraft modpack. Creating specified output format...");
+
+            // If the user doesn't want a zip, copy the dir over
+            if (this.noZip) {
+                try {
+                    Path dest = Path.of("dumper"); // DO NOT MAKE THIS BLANK. Will clear working dir otherwise
+                    FileUtils.deleteDirectory(dest.toFile());
+                    FileUtils.moveDirectory(outDir.toFile(), dest.toFile());
+                } catch (IOException e) {
+                    LOGGER.error("Failed to move dumper directory.", e);
+                    quit(e);
+                    return;
+                }
+            } else {
+                try {
+                    LOGGER.info("Creating dumper.zip");
+                    DumperIO.zipOutput(this.outDir);
+                    LOGGER.info("Created dumper.zip");
+                } catch (IOException e) {
+                    LOGGER.error("Failed to create dumper.zip", e);
+                    quit(e);
+                    return;
+                } finally {
+                    try {
+                        LOGGER.info("got here");
+                        FileUtils.deleteDirectory(outDir.toFile());
+                    } catch (IOException e) {
+                        LOGGER.error("Failed to delete temporary directory", e);
+                        quit(e);
+                    }
+                }
+            }
+
+            quit();
             return;
         }
 
         // Main extraction block for client side
+        if (scrapedClient) return; // Protect client from multiple scrapes
         try {
             // Create and populate the assets directory
-            ResourceScraper scraper = new ResourceScraper(ResourceScraper.Side.CLIENT, OUT_DIR.resolve("assets"));
+            ResourceScraper scraper = new ResourceScraper(ResourceScraper.Side.CLIENT, outDir.resolve("assets"));
             scraper.scrape("models");
             scraper.scrape("blockstates");
             scraper.scrape("lang");
             scraper.scrape("textures");
 
             scrapedClient = true;
-            try {
-                zipOutput();
-                FileUtils.deleteDirectory(OUT_DIR.toFile());
-            } catch (IOException e) {
-                LOGGER.error("Failed to create dumper.zip", e);
-            } finally {
-                quit();
-            }
         } catch (IOException e) {
             LOGGER.error("Failed to scrape client assets", e);
-            quit();
+            quit(e);
         }
     }
 
-    private void writeToFile(String output, JsonElement data) throws IOException {
-        FileUtils.writeStringToFile(
-            OUT_DIR.resolve(output).toFile(),
-            Dumper.GSON.toJson(data),
-            StandardCharsets.UTF_8
-        );
-        LOGGER.info("Created file {}", output);
-    }
 
-    private void zipOutput() throws IOException {
-        Path zip = OUT_DIR.resolveSibling("dumper.zip");
-
-        try (
-            ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(zip));
-            Stream<Path> paths = Files.walk(OUT_DIR)
-        ) {
-            paths.filter(Files::isRegularFile).forEach(file -> {
-                try {
-                    zos.putNextEntry(new ZipEntry(OUT_DIR.relativize(file).toString().replace('\\', '/')));
-                    Files.copy(file, zos);
-                    zos.closeEntry();
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
-                }
-            });
-        }
+    // Utility methods
+    /**
+     * Quits minecraft safely. Use when dumper has finished dumping or a
+     * critical error in scraping/dumping is encountered
+     */
+    private void quit() {
+        this.quit(null);
     }
 
     /**
      * Quits minecraft safely. Use when dumper has finished dumping or a
      * critical error in scraping/dumping is encountered
      */
-    private static void quit() {
+    private void quit(@Nullable Exception error) {
         if (quitRequested) return;
         quitRequested = true;
+        LOGGER.warn("Requesting quit of minecraft. Minecraft will close or crash soon");
 
+        if (this.noQuit) return;
+
+        if (error != null) {
+            Minecraft.getInstance().emergencySave();
+            Minecraft.getInstance().delayCrash(new CrashReport("Dumper failed", error));
+            return;
+        }
         DistExecutor.unsafeRunWhenOn(Dist.CLIENT, () -> () -> Minecraft.getInstance().stop());
         DistExecutor.unsafeRunWhenOn(Dist.DEDICATED_SERVER, () -> () -> {
             MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
@@ -226,7 +287,11 @@ public class Dumper {
      * @param clazz The class that is the parent of the logger being created
      * @return A logger that is to be used for the current class
      */
-    public static Logger getLogger(Class<?> clazz) {
-        return LoggerFactory.getLogger(MOD_ID + "/" + clazz.getSimpleName());
+    public static Logger getLogger(@Nullable Class<?> clazz) {
+        return LoggerFactory.getLogger(
+            MOD_ID.substring(0, 1).toUpperCase() +
+                MOD_ID.substring(1) +
+                (clazz == null ? "" : "/" + clazz.getSimpleName())
+        );
     }
 }
